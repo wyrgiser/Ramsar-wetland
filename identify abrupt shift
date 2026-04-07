@@ -1,0 +1,275 @@
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(gridExtra)
+library(chngpt)
+library(parallel)
+
+library(readr)
+library(fs)
+
+#library(maptools)
+
+#Time Series is NDVI data. Columns 1:19 are NDVI, column nn is number of valid data and column Point.ID is the identifier if the point.
+df2=read.csv("")
+
+dff=df2[,c(24,25,3:22)]
+Sites=unique(dff$id)
+head(dff)
+
+ids=dff$Point.ID[dff$nn>=17]  #only use cases with 16 or more valid years
+
+#Prepare parallel
+noCores=detectCores()-1
+cl=makeCluster(noCores)
+clusterEvalQ(cl,library("chngpt"))
+
+
+dfres=parLapply(cl,ids, function(x,df){
+  dfi=data.frame(year=seq(from=2001, to=2020),NDVI=as.numeric(df[df$Point.ID==x,c(3:22)])) #Build the dataset for the site time series
+  dfi=as.data.frame(lapply(dfi, function(y){return((y-mean(y,na.rm = TRUE))/sd(y,na.rm = TRUE))})) #Standardization of variables
+  dfi$md=mahalanobis(dfi,center = apply(dfi[,1:2], MARGIN = 2, FUN=function(x) return(median(x,na.rm = TRUE))),cov = cov(dfi,use = "complete.obs")) #Calculates mahalanobis distance
+  dfi=dfi[complete.cases(dfi),]
+  dfi$md[dfi$md<12]=6 #Enforce md<12 to be 6; these are most likely chosen as have no significant MD (significance level of MD following a chisquared distribution is 12)
+
+  dfresi=lapply(1:100, function(yy,dd) {
+      #boot sample
+      dd=dd[sample(1:nrow(dd),nrow(dd),replace = TRUE,prob = 1/dd$md),]
+      #fitting models
+      mdl0=glm(data=dd,formula=NDVI~1,family = "gaussian")
+      mdl1=glm(data=dd,formula=NDVI~year,family = "gaussian")
+      mdl2=glm(data = dd,formula = NDVI~poly(year,degree = 2),family = "gaussian")
+      mdl3=chngptm(formula.1 = NDVI~1,formula.2 = ~year,data = dd,type="step",family = "gaussian")
+      
+      #Model selection
+      aics=c(aic.notrend=mdl0$aic,aic.Lineal=mdl1$aic,aic.Quad=mdl2$aic,aic.Step=mdl3$best.fit$aic) #build AICs
+      aics=aics[order(aics)] #ordered aics
+      daics=aics-min(aics) #delta AICs to see their corresponding difference with the best model
+      complexity=c("aic.notrend","aic.Lineal","aic.Step","aic.Quad") #model complexity from less to most complex
+
+      daics[daics<2]=0 #delta aics lower than 2 are set to 0
+      bf=complexity[min(match(names(daics[daics==0]),complexity))] #decide among daics = 0 which is the less complex
+      bf=strsplit(bf,".",fixed = TRUE)[[1]][2] #extract the name of the best fit
+      
+      
+      #The whole process of model selection is repeated without taking into account steps
+      aicsLQ=c(aic.notrend=mdl0$aic,aic.Lineal=mdl1$aic,aic.Quad=mdl2$aic) #this is not taking into account steps
+      aicsLQ=aicsLQ[order(aicsLQ)]
+      daicsLQ=aicsLQ-min(aicsLQ)
+      complexity2=c("aic.notrend","aic.Lineal","aic.Quad")
+
+      daicsLQ[daicsLQ<2]=0
+      bfLQ=complexity2[min(match(names(daicsLQ[daicsLQ==0]),complexity2))]
+      bfLQ=strsplit(bfLQ,".",fixed = TRUE)[[1]][2]      
+
+      
+      coffall=c(a=NA,b=NA,stp=NA,chnpt=NA) #allocate a vector of parameters
+      coffLQ=c(aLQ=NA,bLQ=NA) #and another one without steps
+      
+      #Set parameter values of the best model
+      if(bf=="Lineal"){
+        coffall[2]=mdl1$coefficients[2]
+      }else if (bf=="Quad"){
+        coffall[1]=mdl2$coefficients[3]
+        coffall[2]=mdl2$coefficients[2]
+      } else if (bf=="Step"){
+        coffall[3]=mdl3$best.fit$coefficients[2]
+        coffall[4]=mdl3$coefficients[3]
+      }
+      
+      #The same without taking into account steps
+      if(bfLQ=="Lineal"){
+        coffLQ[2]=mdl1$coefficients[2]
+      }else if (bfLQ=="Quad"){
+        coffLQ[1]=mdl2$coefficients[3]
+        coffLQ[2]=mdl2$coefficients[2]
+      }
+      
+      #generate vector of results
+      vv=as.data.frame(t(c(btID=yy,coffall,coffLQ)))
+      vv$bestfit=bf
+      vv$bestfitLQ=bfLQ
+      return(vv)
+  },dd=dfi)
+  dfresi=as.data.frame(do.call(rbind,dfresi)) #this contains results of all bootstraps for this site
+  
+  bff=table(dfresi$bestfit)  #check which is the best fit and how many times it is
+  bf=names(bff[which.max(bff)])
+  certainty.bf=max(bff)/sum(bff) #certainty of best model selection
+  coff=c(a=NA,b=NA,stp=NA,aci=NA,bci=NA,stpci=NA,sdchngpt=NA,chngpt=NA) #allocate for this site parameters results
+  #calculate medians of parameters of the best fit and confidence intervals
+  if(bf=="Lineal"){
+    coff[2]=median(dfresi$b[dfresi$bestfit=="Lineal"])
+    coff[5]=median(dfresi$b[dfresi$bestfit=="Lineal"])-quantile(dfresi$b[dfresi$bestfit=="Lineal"],0.05)
+  }else if (bf=="Quad"){
+    coff[1]=median(dfresi$a[dfresi$bestfit=="Quad"])
+    coff[2]=median(dfresi$b[dfresi$bestfit=="Quad"])
+    coff[4]=median(dfresi$a[dfresi$bestfit=="Quad"])-quantile(dfresi$a[dfresi$bestfit=="Quad"],0.05)
+    coff[5]=median(dfresi$b[dfresi$bestfit=="Quad"])-quantile(dfresi$b[dfresi$bestfit=="Quad"],0.05)
+  } else if (bf=="Step"){
+    coff[3]=median(dfresi$stp[dfresi$bestfit=="Step"])
+    coff[6]=median(dfresi$stp[dfresi$bestfit=="Step"])-quantile(dfresi$stp[dfresi$bestfit=="Step"],0.05)
+    coff[7]=sd(dfresi$chnpt[dfresi$bestfit=="Step"],na.rm = TRUE)
+    coff[8]=median(dfresi$chnpt[dfresi$bestfit=="Step"],na.rm = TRUE)
+  }
+  
+  #We do the same without taking into account steps
+  bffLQ=table(dfresi$bestfitLQ)
+  bfLQ=names(bffLQ[which.max(bffLQ)])
+  certainty.bfLQ=max(bffLQ)/sum(bffLQ)
+  coffLQ=c(aLQ=NA,bLQ=NA,aciLQ=NA,bciLQ=NA)
+  if(bfLQ=="Lineal"){
+    coffLQ[2]=median(dfresi$bLQ[dfresi$bestfitLQ=="Lineal"])
+    coffLQ[4]=median(dfresi$bLQ[dfresi$bestfitLQ=="Lineal"])-quantile(dfresi$bLQ[dfresi$bestfitLQfit=="Lineal"],0.05)
+  }else if (bfLQ=="Quad"){
+    coffLQ[1]=median(dfresi$aLQ[dfresi$bestfitLQ=="Quad"])
+    coffLQ[2]=median(dfresi$bLQ[dfresi$bestfitLQ=="Quad"])
+    coffLQ[3]=median(dfresi$aLQ[dfresi$bestfitLQ=="Quad"])-quantile(dfresi$aLQ[dfresi$bestfitLQ=="Quad"],0.05)
+    coffLQ[4]=median(dfresi$bLQ[dfresi$bestfitLQ=="Quad"])-quantile(dfresi$bLQ[dfresi$bestfitLQ=="Quad"],0.05)
+  }
+  
+  vvr=as.data.frame(t(c(Point.ID=x,certainty.bf=certainty.bf,certainty.bfLQ=certainty.bfLQ,coff,coffLQ))) #final vector of results
+  vvr$bestfit=bf
+  vvr$bestfitLQ=bfLQ
+  
+  return(vvr)
+  
+},df=dff)
+
+stopCluster(cl)
+
+dfres2=as.data.frame(do.call(rbind,dfres)) #final database of clasification
+
+
+dfres=data_filtered #the classified typologies file
+recheck=read.csv("") #the results of the KS test comparing NDVI prior/after change point
+recheck$invalid=recheck$pvalKS>0.05 #not significant differences on NDVI are marked as invalid
+invalids=recheck$site[recheck$invalid=="TRUE"]
+
+
+#put as type=2 those sites to be re-clasified
+dfres$type=1
+dfres$type[dfres$chngpt<(-1.1258)]=2 #Meet criteria 1 (left side)
+dfres$type[dfres$chngpt>(1.2990)]=2 #Meet criteria 1 (right side)
+dfres$type[dfres$sdchngpt>0.7716748]=2 #Meet Criteria 2
+dfres$type[dfres$bestfit=="Step" & dfres$certainty.bf<0.66]=2 #Meet criteria 2
+dfres$type[dfres$Point.ID %in% invalids]=2 #Meet criteria 3
+
+dfres$subtypes=NA
+dfres$subtypes[dfres$bestfit=="Step" & dfres$stp>0]="Positive Step"
+dfres$subtypes[dfres$bestfit=="Step" & dfres$stp<0]="Negative Step"
+dfres$subtypes[dfres$bestfit=="Lineal" & dfres$b<0]="Negative Linear"
+dfres$subtypes[dfres$bestfit=="Lineal" & dfres$b>0]="Positive Linear"
+dfres$subtypes[dfres$bestfit=="Quad" & dfres$a>0 & (dfres$b- dfres$bci)>0]="Positive Quad"
+dfres$subtypes[dfres$bestfit=="Quad" & dfres$a<0 & (dfres$b+dfres$bci)<0]="Negative Quad"
+dfres$subtypes[dfres$bestfit=="Quad" & dfres$a<0 & (dfres$b-dfres$bci)>0]="Positive Quad"
+dfres$subtypes[dfres$bestfit=="Quad" & dfres$a>0 & (dfres$b+dfres$bci)<0]="Negative Quad"
+dfres$subtypes[dfres$bestfit=="Quad" & dfres$a<0 & (dfres$b-dfres$bci)<0 & (dfres$b+dfres$bci)>0]="Shifting"
+dfres$subtypes[dfres$bestfit=="Quad" & dfres$a>0 & (dfres$b-dfres$bci)<0 & (dfres$b+dfres$bci)>0]="Shifting"
+dfres$subtypes[dfres$bestfit=="notrend"]="notrend"
+
+#do the same for cases not taking into account steps
+dfres$subtypesLQ=NA
+dfres$subtypesLQ[dfres$bestfitLQ=="Lineal" & dfres$bLQ<0]="Negative Linear"
+dfres$subtypesLQ[dfres$bestfitLQ=="Lineal" & dfres$bLQ>0]="Positive Linear"
+dfres$subtypesLQ[dfres$bestfitLQ=="Quad" & dfres$aLQ>0 & (dfres$bLQ- dfres$bciLQ)>0]="Positive Quad"
+dfres$subtypesLQ[dfres$bestfitLQ=="Quad" & dfres$aLQ<0 & (dfres$bLQ+dfres$bciLQ)<0]="Negative Quad"
+dfres$subtypesLQ[dfres$bestfitLQ=="Quad" & dfres$aLQ<0 & (dfres$bLQ-dfres$bciLQ)>0]="Positive Quad"
+dfres$subtypesLQ[dfres$bestfitLQ=="Quad" & dfres$aLQ>0 & (dfres$bLQ+dfres$bciLQ)<0]="Negative Quad"
+dfres$subtypesLQ[dfres$bestfitLQ=="Quad" & dfres$aLQ<0 & (dfres$bLQ-dfres$bciLQ)<0 & (dfres$bLQ+dfres$bciLQ)>0]="Shifting"
+dfres$subtypesLQ[dfres$bestfitLQ=="Quad" & dfres$aLQ>0 & (dfres$bLQ-dfres$bciLQ)<0 & (dfres$bLQ+dfres$bciLQ)>0]="Shifting"
+dfres$subtypesLQ[dfres$bestfitLQ=="notrend"]="notrend"
+
+#finally assign different bestfit and subtypes to step cases that need re-clasification.
+dfres$bestfit[dfres$type==2]=dfres$bestfitLQ[dfres$type==2]
+dfres$subtypes[dfres$type==2]=dfres$subtypesLQ[dfres$type==2]
+
+
+Dynamic=origin
+Dynamic=Dynamic[,c(24,25,3:22)]
+
+
+#In the subset of steps with sdchngpt<=0.68; i.e., those whose uncertainty in clasification is not driven by noisy changepoint
+sites=dfres$Point.ID[dfres$bestfit=="Step" & dfres$sdchngpt<=0.7716748]
+  
+dd=dfres[dfres$Point.ID %in% sites,]
+
+hist(dd$certainty.bf)
+
+library(chngpt)
+#Calculate R2 of the fittings
+res=lapply(sites, function(x,df,dfres){
+  dfi=data.frame(year=seq(from=2001, to=2020),NDVI=as.numeric(df[df$Point.ID==x,c(3:22)]))
+  dfi=as.data.frame(lapply(dfi, function(y){return((y-mean(y,na.rm = TRUE))/sd(y,na.rm = TRUE))})) #Standardization of variables
+  mdl3=chngptm(formula.1 = NDVI~1,formula.2 = ~year,data = dfi,type="step",family = "gaussian")
+  Rsq=1-mdl3$best.fit$deviance/mdl3$best.fit$null.deviance
+  conf=dfres$certainty.bf[dfres$Point.ID==x]
+  
+  return(data.frame(site=x,Rsq=Rsq,conf=conf))
+},df=Dynamic,dfres=dd)
+res=do.call(rbind,res) 
+#A discontinuity is spotted at 0.72. To plot it (Fig.S4)
+windowsFonts(Times=windowsFont("Times New Roman"))
+res$type=1
+res$type[res$conf<0.70]=2
+p2<-ggplot(data = res,aes(x = conf,y=Rsq,group=type))+
+  theme_classic()+
+  geom_point(size=0.01)+
+  ylab(expression(R^2))+
+  xlab("Confidence in abrupt shift classification")+
+  geom_smooth(method = "lm", color = "#d73027", linewidth = 1.5)+
+  theme(
+    axis.title = element_text(family = "Times", size = 18),
+    axis.text  = element_text(family = "Times", size = 16,
+  colour = "black"),
+  axis.line  = element_line(size = 1, colour = "black"),
+    axis.ticks = element_line(size = 1, colour = "black")
+  )
+
+# 图2
+p2
+
+ggsave(
+  filename = "",
+  plot = p2,
+  width = 12,       # 单位英寸（很关键）
+  height = 8,
+  dpi = 1000,
+  units = "in"
+)
+
+p<-ggplot(data = res,aes(x = conf))+
+  theme_classic()+
+  geom_histogram()+
+  xlab("Confidence in Step classification")+
+  geom_vline(xintercept = 0.74)
+p
+
+library(gridExtra)
+fig=arrangeGrob(p,p2)
+
+library(ggplot2)
+dfres = dfres_type1
+dfres$type[dfres$sdchngpt>0.7716748]=2
+p2<-ggplot(data = dfres[dfres$bestfit=="Step",],aes(x=sdchngpt,y=certainty.bf))+
+  theme_classic()+
+  geom_point(size=0.1)+
+  geom_smooth(method = "lm",aes(group=type),color="#d73027")+
+  geom_density2d()+
+  labs(
+    x = "Standard deviation",
+    y = "Confidence"
+  ) +
+  theme(
+    axis.title = element_text(family = "Times", size = 18),
+    axis.text  = element_text(family = "Times", size = 16,
+  colour = "black"),
+  axis.line  = element_line(size = 1, colour = "black"),
+    axis.ticks = element_line(size = 1, colour = "black")
+  )
+
+p2
