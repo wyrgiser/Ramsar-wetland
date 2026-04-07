@@ -1,0 +1,176 @@
+import pandas as pd
+import numpy as np
+from sklearn.linear_model import LinearRegression
+import statsmodels.api as sm
+
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import statsmodels.api as sm
+from sklearn.linear_model import LinearRegression
+from matplotlib import rcParams
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import statsmodels.api as sm
+from sklearn.linear_model import LinearRegression
+
+
+import pandas as pd
+import numpy as np
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+import statsmodels.api as sm
+from sklearn.linear_model import LinearRegression
+
+
+data_out = pd.read_csv(species richness_slope.csv)
+
+
+
+def calc_slope_after_mutation(yearchngpt, row, window=3):
+    if pd.isna(yearchngpt):
+        return np.nan
+    start_year = int(yearchngpt)
+
+    years = [f"count_{y}" for y in range(start_year, start_year + window)]
+
+    if not all(col in row.index for col in years):
+        return np.nan
+
+    counts = [row[col] for col in years]
+
+    if any(pd.isna(c) for c in counts):
+        return np.nan
+
+    X = np.arange(len(counts)).reshape(-1, 1)
+    y = np.array(counts)
+    model = LinearRegression().fit(X, y)
+    return model.coef_[0]
+
+
+
+data_out["slope_3yr"] = data_out.apply(
+    lambda row: calc_slope_after_mutation(row["yearchngpt"], row, window=3), axis=1
+)
+data_out["slope_4yr"] = data_out.apply(
+    lambda row: calc_slope_after_mutation(row["yearchngpt"], row, window=4), axis=1
+)
+data_out["slope_5yr"] = data_out.apply(
+    lambda row: calc_slope_after_mutation(row["yearchngpt"], row, window=5), axis=1
+)
+data_out["slope_6yr"] = data_out.apply( 
+    lambda row: calc_slope_after_mutation(row["yearchngpt"], row, window=6), axis=1
+)
+
+
+slope_cols = ["slope_3yr", "slope_4yr", "slope_5yr", "slope_6yr"]
+plot_data = data_out.dropna(subset=["magnitude_mean"] + slope_cols)
+
+
+
+labels = ['a', 'b', 'c', 'd']  
+
+titles = [
+    "3-Year Post Disturbance",
+    "4-Year Post Disturbance",
+    "5-Year Post Disturbance",
+    "6-Year Post Disturbance"
+]
+
+
+fig = plt.figure(figsize=(12, 10))
+gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.3)
+
+
+ax1 = fig.add_subplot(gs[0, 0])  
+ax2 = fig.add_subplot(gs[0, 1]) 
+ax3 = fig.add_subplot(gs[1, 0]) 
+ax4 = fig.add_subplot(gs[1, 1])  
+axes = [ax1, ax2, ax3, ax4]
+
+for i, (ax, label, title) in enumerate(zip(axes, labels, titles)):
+
+    X = sm.add_constant(plot_data["magnitude_mean"])
+    y = plot_data[slope_cols[i]]
+    model = sm.OLS(y, X).fit()
+
+
+    sns.regplot(
+        data=plot_data,
+        x="magnitude_mean",
+        y=slope_cols[i],
+        ci=95,
+        ax=ax,
+        scatter_kws={'alpha': 0.7, 'color': '#6185b6', 's': 30},
+        line_kws={'color': 'black', 'linewidth': 1.25},
+        color='#babdbf'
+    )
+
+
+    p_value = model.pvalues['magnitude_mean']
+    if p_value < 0.001:
+        p_text = "< 0.001"
+    elif p_value < 0.01:
+        p_text = "< 0.01"
+    elif p_value < 0.05:
+        p_text = "< 0.05"
+    else:
+        p_text = f"{p_value:.3g}"
+
+    formula_text = (
+        f"y = {model.params['const']:.3f} + {model.params['magnitude_mean']:.3f}x\n"
+        f"ρ {p_text}"
+    )
+
+    ax.text(
+        0.05, 0.95, formula_text,
+        transform=ax.transAxes,
+        fontsize=12,
+        fontname="Times New Roman",  
+        va='top',
+        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', alpha=0.8)
+    )
+
+    ax.text(
+        -0.1, 1.05, label,
+        transform=ax.transAxes,
+        fontsize=20,
+        fontweight='bold',
+        fontname="Times New Roman"
+    )
+    ax.set_title("", fontname="Times New Roman", fontsize=16, pad=10)
+
+
+    if label in ['a', 'c']:
+        ax.set_ylabel("Species richness slope (yr$^{-1}$)", fontname="Times New Roman", fontsize=18)
+    else:
+        ax.set_ylabel("")  
+
+    if label in ['c', 'd']:
+        ax.set_xlabel("Mean intensity", fontname="Times New Roman", fontsize=18, labelpad=15)
+    else:
+        ax.set_xlabel("") 
+
+
+    ax.set_title(title, fontsize=18, pad=10)
+
+
+    for spine in ax.spines.values():
+        spine.set_linewidth(1.25)
+
+    ax.grid(True, alpha=0.3, linestyle='--')
+
+    for tick in ax.get_xticklabels() + ax.get_yticklabels():
+        tick.set_fontsize(16)
+        tick.set_fontname("Times New Roman")
+
+
+plt.tight_layout()
+
+plt.show()
