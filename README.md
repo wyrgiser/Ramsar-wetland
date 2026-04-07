@@ -1,0 +1,1 @@
+This repository contains code for analysis and figures of the article entitled 'Temperature-induced intensification of positive abrupt vegetation shifts in global Ramsar wetlands enhanced waterbird diversity'
